@@ -1,25 +1,33 @@
+import jax
+import time
 import numpy as onp
 import jax.numpy as np
+#import pygmo as pg
 from jax import vmap, jit, jvp, vjp, random
 from jax.scipy.linalg import cholesky, solve_triangular
 from jax.flatten_util import ravel_pytree
 from jax.scipy.special import expit as sigmoid
-from jax.ops import index_update, index
+#from jax.ops import index_update, index
 from functools import partial
 
 import jaxbo.kernels as kernels
 import jaxbo.acquisitions as acquisitions
 import jaxbo.initializers as initializers
 import jaxbo.utils as utils
-from jaxbo.optimizers import minimize_lbfgs
+from jaxbo.optimizers import minimize_lbfgs, minimize_de, minimize_optax
 from sklearn import mixture
 from pyDOE import lhs
 
 from jax.scipy.stats import norm
+from jax._src.lax import linalg as lax_linalg
+from jax.config import config
+config.update("jax_enable_x64", True)
+config.update("jax_debug_nans", False)
 
+from jax.lax import Precision
 #onp.random.seed(1234)
 
-# Define a general master class 
+# Define a general master class
 class GPmodel():
     def __init__(self, options):
         # Initialize the class
@@ -33,6 +41,8 @@ class GPmodel():
             self.kernel = kernels.Matern32
         elif options['kernel'] == 'RatQuad':
             self.kernel = kernels.RatQuad
+        elif options['kernel'] == 'RBF_fractional':
+            self.kernel = kernels.RBF_fractional
         elif options['kernel'] == None:
             self.kernel = kernels.RBF
         else:
@@ -43,22 +53,26 @@ class GPmodel():
     def likelihood(self, params, batch):
         y = batch['y']
         N = y.shape[0]
+
         # Compute Cholesky
         L = self.compute_cholesky(params, batch)
         # Compute negative log-marginal likelihood
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        NLML = 0.5*np.matmul(np.transpose(y),alpha) + \
-               np.sum(np.log(np.diag(L))) + 0.5*N*np.log(2.0*np.pi)
+        NLML = 0.5 * np.matmul(np.transpose(y),alpha, precision=Precision.HIGHEST) + \
+                np.sum(np.log(np.diag(L))) + 0.5 * N * np.log(2.0 * np.pi)
+
         return NLML
 
     @partial(jit, static_argnums=(0,))
     def likelihood_value_and_grad(self, params, batch):
         fun = lambda params: self.likelihood(params, batch)
         primals, f_vjp = vjp(fun, params)
-        grads = f_vjp(np.ones_like(primals))[0]
+        grads = f_vjp(np.ones_like(primals, dtype=np.float64))[0]
+        grads = np.nan_to_num(grads, nan = -1)
+        #temp = onp.asarray(grads)
         return primals, grads
 
-    def fit_gmm(self, num_comp = 2, N_samples = 10000, **kwargs):
+    def fit_gmm(self, num_comp=2, N_samples=10000, **kwargs):
         bounds = kwargs['bounds']
         lb = bounds['lb']
         ub = bounds['ub']
@@ -69,7 +83,7 @@ class GPmodel():
 
         # set the seed for sampling X
         onp.random.seed(rng_key[0])
-        X = lb + (ub-lb)*lhs(dim, N_samples)
+        X = lb + (ub - lb) * lhs(dim, N_samples)
 
         y = self.predict(X, **kwargs)[0]
         # Sample data according to prior
@@ -78,7 +92,7 @@ class GPmodel():
         rng_key = random.split(rng_key)[0]
         onp.random.seed(rng_key[0])
 
-        X_samples = lb + (ub-lb)*lhs(dim, N_samples)
+        X_samples = lb + (ub - lb) * lhs(dim, N_samples)
         y_samples = self.predict(X_samples, **kwargs)[0]
 
         # Compute p_x and p_y from samples across the entire domain
@@ -86,7 +100,7 @@ class GPmodel():
         p_x_samples = self.input_prior.pdf(X_samples)
 
         p_y = utils.fit_kernel_density(y_samples, y, weights = p_x_samples)
-        weights = p_x/p_y
+        weights = p_x / p_y
         # Label each input data
         indices = np.arange(N_samples)
         # Scale inputs to [0, 1]^D
@@ -132,26 +146,26 @@ class GPmodel():
             # The following two lines for learning constraints
             norm_const = kwargs['norm_const']
             mean = mean * norm_const['sigma_y'] + norm_const['mu_y']
-            std =  std * norm_const['sigma_y']
+            std = std * norm_const['sigma_y']
             return acquisitions.CLSF(mean, std, kappa)
         elif self.options['criterion'] == 'LW_CLSF':
             kappa = kwargs['kappa']
             # The following two lines for learning constraints
             norm_const = kwargs['norm_const']
             mean = mean * norm_const['sigma_y'] + norm_const['mu_y']
-            std =  std * norm_const['sigma_y']
+            std = std * norm_const['sigma_y']
             weights = utils.compute_w_gmm(x, **kwargs)
             return acquisitions.LW_CLSF(mean, std, weights, kappa)
         elif self.options['criterion'] == 'IMSE':
-            # See Eq. (2.7), https://arxiv.org/pdf/2006.12394.pdf
+            # See Eq.  (2.7), https://arxiv.org/pdf/2006.12394.pdf
             rng_key = kwargs['rng_key']
             bounds = kwargs['bounds']
             lb = bounds['lb']
             ub = bounds['ub']
             dim = lb.shape[0]
-            xp = lb + (ub-lb)*random.uniform(rng_key, (10000,dim))    
+            xp = lb + (ub - lb) * random.uniform(rng_key, (10000,dim))    
             cov = self.posterior_covariance(x, xp, **kwargs)
-            IMSE = np.mean(cov**2)/std**2
+            IMSE = np.mean(cov ** 2) / std ** 2
             return IMSE[0]
         elif self.options['criterion'] == 'IMSE_L':
             rng_key = kwargs['rng_key']
@@ -160,9 +174,9 @@ class GPmodel():
             ub = bounds['ub']
             dim = lb.shape[0]
             _, std = self.predict_L(x, **kwargs)
-            xp = lb + (ub-lb)*random.uniform(rng_key, (10000,dim)) 
+            xp = lb + (ub - lb) * random.uniform(rng_key, (10000,dim)) 
             cov = self.posterior_covariance_L(x, xp, **kwargs)
-            IMSE = np.mean(cov**2)/std**2
+            IMSE = np.mean(cov ** 2) / std ** 2
             return IMSE[0]
         else:
             raise NotImplementedError
@@ -174,7 +188,7 @@ class GPmodel():
         grads = f_vjp(np.ones_like(primals))[0]
         return primals, grads
 
-    def compute_next_point_lbfgs(self, num_restarts = 10, **kwargs):
+    def compute_next_point_lbfgs(self, num_restarts=10, **kwargs):
         # Define objective that returns NumPy arrays
         def objective(x):
             value, grads = self.acq_value_and_grad(x, **kwargs)
@@ -190,7 +204,7 @@ class GPmodel():
         dim = lb.shape[0]
 
         onp.random.seed(rng_key[0])
-        x0 = lb + (ub-lb)*lhs(dim, num_restarts)
+        x0 = lb + (ub - lb) * lhs(dim, num_restarts)
         #print("x0 for bfgs", x0)
         dom_bounds = tuple(map(tuple, np.vstack((lb, ub)).T))
         for i in range(num_restarts):
@@ -200,16 +214,85 @@ class GPmodel():
         loc = np.vstack(loc)
         acq = np.vstack(acq)
         idx_best = np.argmin(acq)
-        x_new = loc[idx_best:idx_best+1,:]
-        return x_new, acq, loc
+        a_min = np.min(acq)
+        x_new = loc[idx_best:idx_best + 1,:]
+        return x_new, a_min, loc
+
+    def compute_next_point_de(self, **kwargs):
+        # Define objective that returns NumPy arrays
+        def objective(x):
+            value, grads = self.acq_value_and_grad(x, **kwargs)
+            out = (onp.array(value))
+            return out
+        # Optimize with random restarts
+        loc = []
+        acq = []
+        bounds = kwargs['bounds']
+        lb = bounds['lb']
+        ub = bounds['ub']
+        dom_bounds = tuple(map(tuple, np.vstack((lb, ub)).T))
+
+        dom_bounds = tuple(map(tuple, np.vstack((lb, ub)).T))
+        pos, val = minimize_de(objective, bnds = dom_bounds, maxiter = 1000, popsize = 50, seed = None)
+
+        #x_new = device_put(pos)
+        x_new = np.reshape(np.asarray(pos), (1, -1))
+        ei = np.asarray(val)
+        return x_new, val
 
     def compute_next_point_gs(self, X_cand, **kwargs):
         fun = lambda x: self.acquisition(x, **kwargs)
         acq = vmap(fun)(X_cand)
         idx_best = np.argmin(acq)
-        x_new = X_cand[idx_best:idx_best+1,:]
+        x_new = X_cand[idx_best:idx_best + 1,:]
         return x_new
 
+#def compute_next_point_pygmo(gp, **kwargs):
+#        loc = []
+#        acq = []
+#        bounds = kwargs['bounds']
+#        lb = bounds['lb']
+#        ub = bounds['ub']
+#        #fun = lambda x: self.acquisition(x, **kwargs)
+#        class acquisition_prob(GP):
+#            def __init__(self, gp):
+#                self.__dict__ = gp.__dict__.copy()
+
+#            def fitness(self, x):
+#                value, grads = self.acq_value_and_grad(x, **kwargs)
+#                print("VALUE = ", value)
+#                out = onp.array(value)
+#                print("OUT ARRAY = ", out)
+#                out.tolist()
+#                print("OUT LIST = ", out)
+#                out = onp.reshape(out, (1, -1))
+#                out = out[0]
+#                return out
+
+#            def get_bounds(self):
+#                return (lb, ub)
+       
+#        p = pg.problem(acquisition_prob(acquisition_prob(gp)))
+#        print(p)
+#        algo_sade = pg.algorithm(pg.sade(2000))
+#        pop = pg.population(prob = p , size = int(70))
+#        isl = pg.island(algo = algo_sade, pop = pop)
+#        print(isl)
+
+#        isl.evolve(1)
+#        isl.wait_check()
+#        x_new = pop.champion_x
+#        #archi = pg.archipelago(n=6, algo = algo_sade, prob = p, pop_size =
+#        70)
+#        #archi.evolve()
+#        #archi.wait_check()
+#        #champs_f = onp.array(archi.get_champions_f())
+#        #champs_x = onp.array(archi.get_champions_x())
+#        #idx_best = champs_f.argmax()
+#        #x_new = champs_x[idx_best]
+#        x_new = np.reshape(np.asarray(x_new), (1, -1))
+
+#        return x_new
 
 # A minimal Gaussian process regression class (inherits from GPmodel)
 class GP(GPmodel):
@@ -225,22 +308,25 @@ class GP(GPmodel):
         sigma_n = np.exp(params[-1])
         theta = np.exp(params[:-1])
         # Compute kernel
-        K = self.kernel(X, X, theta) + np.eye(N)*(sigma_n + 1e-8)
+        K = self.kernel(X, X, theta) + np.eye(N) * (sigma_n + 1e-8)
         L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch, rng_key, num_restarts = 10):
+    def train(self, batch, rng_key, num_restarts=10):
         # Define objective that returns NumPy arrays
         def objective(params):
             value, grads = self.likelihood_value_and_grad(params, batch)
             out = (onp.array(value), onp.array(grads))
+            #print(onp.asarray(grads))
             return out
         # Optimize with random restarts
+        start_time = time.time()
         params = []
         likelihood = []
         dim = batch['X'].shape[1]
         rng_key = random.split(rng_key, num_restarts)
         for i in range(num_restarts):
+            #init = 1e-3*initializers.random_init_GP(rng_key[i], dim)
             init = initializers.random_init_GP(rng_key[i], dim)
             p, val = minimize_lbfgs(objective, init)
             params.append(p)
@@ -252,8 +338,40 @@ class GP(GPmodel):
         idx_best = np.where(likelihood == bestlikelihood)
         idx_best = idx_best[0][0]
         best_params = params[idx_best,:]
-
+        end_time = time.time()
+        duration = end_time-start_time
         return best_params
+#######################################################################################################
+############################################ O P T A X ################################################
+#######################################################################################################
+    def train_optax(self, batch, rng_key, num_restarts=10):
+        # Define objective that returns NumPy arrays
+        def objective(params):
+            value, grads = self.likelihood_value_and_grad(params, batch)
+            return grads, value
+        # Optimize with random restarts
+        start_time = time.time()
+
+        params = []
+        likelihood = []
+        dim = batch['X'].shape[1]
+        rng_key = random.split(rng_key, num_restarts)
+        for i in range(num_restarts):
+            init = 1e-3*initializers.random_init_GP(rng_key[i], dim)
+            p, val = minimize_optax(objective, init)
+            params.append(p)
+            likelihood.append(val)
+        params = np.vstack(params)
+        likelihood = np.vstack(likelihood)
+        #### find the best likelihood besides nan ####
+        bestlikelihood = np.nanmin(likelihood)
+        idx_best = np.where(likelihood == bestlikelihood)
+        idx_best = idx_best[0][0]
+        best_params = params[idx_best,:]
+        end_time = time.time()
+        duration = end_time-start_time
+        return best_params
+
 
     @partial(jit, static_argnums=(0,))
     def predict(self, X_star,  **kwargs):
@@ -262,18 +380,18 @@ class GP(GPmodel):
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         X, y = batch['X'], batch['y']
         # Fetch params
         sigma_n = np.exp(params[-1])
         theta = np.exp(params[:-1])
         # Compute kernels
-        k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0])*(sigma_n + 1e-8)
+        k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0]) * (sigma_n + 1e-8)
         k_pX = self.kernel(X_star, X, theta)
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -287,8 +405,8 @@ class GP(GPmodel):
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        x = (x - bounds['lb'])/(bounds['ub'] - bounds['lb'])
-        xp = (xp - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        x = (x - bounds['lb']) / (bounds['ub'] - bounds['lb'])
+        xp = (xp - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         X, y = batch['X'], batch['y']
         # Fetch params
@@ -300,7 +418,7 @@ class GP(GPmodel):
         k_Xp = self.kernel(X, xp, theta)
         L = self.compute_cholesky(params, batch)
         # Compute covariance
-        beta  = solve_triangular(L.T,solve_triangular(L, k_Xp, lower=True))        
+        beta = solve_triangular(L.T,solve_triangular(L, k_Xp, lower=True))        
         cov = k_pp - np.matmul(k_pX, beta)
         return cov
 
@@ -312,18 +430,18 @@ class GP(GPmodel):
         norm_const = kwargs['norm_const']
         rng_key = kwargs['rng_key']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         X, y = batch['X'], batch['y']
         # Fetch params
         sigma_n = np.exp(params[-1])
         theta = np.exp(params[:-1])
         # Compute kernels
-        k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0])*(sigma_n + 1e-8)
+        k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0]) * (sigma_n + 1e-8)
         k_pX = self.kernel(X_star, X, theta)
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -337,7 +455,19 @@ class MultipleIndependentOutputsGP(GPmodel):
     def __init__(self, options):
         super().__init__(options)
 
-    @partial(jit, static_argnums=(0,))
+    @partial(jit, static_argnums = (0,))
+    def _check_symmetry(self, x: np.ndarray) -> bool:
+      """Check if the array is symmetric."""
+      m, n = x.shape
+      eps = np.finfo(x.dtype).eps
+      tol = 50.0 * eps
+      is_hermitian = False
+      if m == n:
+        if np.linalg.norm(x - x.T.conj()) / np.linalg.norm(x) < tol:
+          is_hermitian = True
+      return is_hermitian
+
+    @partial(jit, static_argnums = (0,))
     def compute_cholesky(self, params, batch):
         X = batch['X']
         N, D = X.shape
@@ -345,28 +475,43 @@ class MultipleIndependentOutputsGP(GPmodel):
         sigma_n = np.exp(params[-1])
         theta = np.exp(params[:-1])
         # Compute kernel
-        K = self.kernel(X, X, theta) + np.eye(N)*(sigma_n + 1e-8)
-        L = cholesky(K, lower=True)
+        K = self.kernel(X, X, theta) + np.eye(N) * (sigma_n + 1e-8)
+        K = (K+ np.conj(K)) / 2.
+        L = lax_linalg.cholesky(K, symmetrize_input=False)
+        #L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch_list, rng_key, num_restarts = 10):
+    def train(self, batch_list, rng_key, num_restarts=10):
         best_params = []
         for _, batch in enumerate(batch_list):
             # Define objective that returns NumPy arrays
             def objective(params):
                 value, grads = self.likelihood_value_and_grad(params, batch)
                 out = (onp.array(value), onp.array(grads))
+                print(onp.asarray(grads))
                 return out
             # Optimize with random restarts
             params = []
             likelihood = []
             dim = batch['X'].shape[1]
             rng_keys = random.split(rng_key, num_restarts)
+            lista = dict()
+            res = []
+            niter = 0
+            def callbackF(param):
+                global niter 
+                lista[niter] = []
+                lista[niter] = [param, objective(param)] 
+                niter += 1
+
             for i in range(num_restarts):
-                init = initializers.random_init_GP(rng_keys[i], dim)
-                p, val = minimize_lbfgs(objective, init)
+                init = 1e-3*initializers.random_init_GP(rng_keys[i], dim)
+                p, val = minimize_lbfgs(objective, init, callback = None)
+                #res = np.diff(np.array(list(lista.values())))
+                #print(res[0])
                 params.append(p)
                 likelihood.append(val)
+
             params = np.vstack(params)
             likelihood = np.vstack(likelihood)
             #### find the best likelihood besides nan ####
@@ -375,20 +520,47 @@ class MultipleIndependentOutputsGP(GPmodel):
             idx_best = np.where(likelihood == bestlikelihood)
             idx_best = idx_best[0][0]
             best_params.append(params[idx_best,:])
-            #print("best_params", best_params)
+            print("best_params", best_params)
+        return best_params
+
+    def train_de(self, batch_list):
+        best_params = []
+        dim = 22
+        lb = -10.0 * onp.ones((dim + 2,))
+        lb[-1] = -14
+        ub = 0.0 * onp.ones((dim + 2,))
+        ub[0] = 3.912
+        ub[-1] = -4
+        dom_bounds = tuple(map(tuple, np.vstack((lb, ub)).T))
+        
+        for _, batch in enumerate(batch_list):
+            # Define objective that returns NumPy arrays
+            def objective(params):
+                value, _ = self.likelihood_value_and_grad(params, batch)
+                out = onp.array(value)
+                return out
+            # Optimize with random restarts
+            params = []
+            likelihood = []
+            dim = batch['X'].shape[1]
+            #rng_keys = random.split(rng_key)[0]
+            
+            best_params, val = minimize_de(objective, bnds = dom_bounds)
+            
         return best_params
 
     @partial(jit, static_argnums=(0,))
     def predict_all(self, X_star, **kwargs):
         mu_list = []
         std_list = []
-        params_list =  kwargs['params']
+        params_list = kwargs['params']
         batch_list = kwargs['batch']
         bounds = kwargs['bounds']
         norm_const_list = kwargs['norm_const']
         zipped_args = zip(params_list, batch_list, norm_const_list)
-        # Normalize to [0,1] (We should do this for once instead of iteratively doing so in the for loop)
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        # Normalize to [0,1] (We should do this for once instead of iteratively
+        # doing so in the for loop)
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
 
         for k, (params, batch, norm_const) in enumerate(zipped_args):
             # Fetch normalized training data
@@ -397,18 +569,18 @@ class MultipleIndependentOutputsGP(GPmodel):
             sigma_n = np.exp(params[-1])
             theta = np.exp(params[:-1])
             # Compute kernels
-            k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0])*(sigma_n + 1e-8)
+            k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0]) * (sigma_n + 1e-8)
             k_pX = self.kernel(X_star, X, theta)
             L = self.compute_cholesky(params, batch)
             alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-            beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+            beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
             # Compute predictive mean, std
             mu = np.matmul(k_pX, alpha)
             cov = k_pp - np.matmul(k_pX, beta)
             std = np.sqrt(np.clip(np.diag(cov), a_min=0.))
             if k > 0:
-                mu = mu*norm_const['sigma_y'] + norm_const['mu_y']
-                std = std*norm_const['sigma_y']
+                mu = mu * norm_const['sigma_y'] + norm_const['mu_y']
+                std = std * norm_const['sigma_y']
             mu_list.append(mu)
             std_list.append(std)
         return np.array(mu_list), np.array(std_list)
@@ -420,18 +592,18 @@ class MultipleIndependentOutputsGP(GPmodel):
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         X, y = batch['X'], batch['y']
         # Fetch params
         sigma_n = np.exp(params[-1])
         theta = np.exp(params[:-1])
         # Compute kernels
-        k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0])*(sigma_n + 1e-8)
+        k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0]) * (sigma_n + 1e-8)
         k_pX = self.kernel(X_star, X, theta)
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -448,15 +620,18 @@ class MultipleIndependentOutputsGP(GPmodel):
             return acquisitions.EIC(mean, std, best)
         elif self.options['constrained_criterion'] == 'LCBC':
             kappa = kwargs['kappa']
-            ##### normalize the mean and std again and subtract the mean by 2*sigma
+            ##### normalize the mean and std again and subtract the mean by
+            ##### 2*sigma
             #norm_const = kwargs['norm_const'][0]
-            #mean[0,:] = (mean[0,:] - norm_const['mu_y']) / norm_const['sigma_y'] - 3 * norm_const['sigma_y']
+            #mean[0,:] = (mean[0,:] - norm_const['mu_y']) /
+            #norm_const['sigma_y'] - 3 * norm_const['sigma_y']
             #std[0,:] = std[0,:] / norm_const['sigma_y']
             #####
             return acquisitions.LCBC(mean, std, kappa)
         elif self.options['constrained_criterion'] == 'LW_LCBC':
             kappa = kwargs['kappa']
-            ##### normalize the mean and std again and subtract the mean by 3*sigma
+            ##### normalize the mean and std again and subtract the mean by
+            ##### 3*sigma
             weights = utils.compute_w_gmm(x, **kwargs)
             return acquisitions.LW_LCBC(mean, std, weights, kappa)
         else:
@@ -469,7 +644,7 @@ class MultipleIndependentOutputsGP(GPmodel):
         grads = f_vjp(np.ones_like(primals))[0]
         return primals, grads
 
-    def constrained_compute_next_point_lbfgs(self, num_restarts = 10, **kwargs):
+    def constrained_compute_next_point_lbfgs(self, num_restarts=10, **kwargs):
         # Define objective that returns NumPy arrays
         def objective(x):
             value, grads = self.constrained_acq_value_and_grad(x, **kwargs)
@@ -485,7 +660,7 @@ class MultipleIndependentOutputsGP(GPmodel):
         dim = lb.shape[0]
 
         onp.random.seed(rng_key[0])
-        x0 = lb + (ub-lb)*lhs(dim, num_restarts)
+        x0 = lb + (ub - lb) * lhs(dim, num_restarts)
         #print("x0 for bfgs", x0)
         dom_bounds = tuple(map(tuple, np.vstack((lb, ub)).T))
         for i in range(num_restarts):
@@ -495,12 +670,15 @@ class MultipleIndependentOutputsGP(GPmodel):
         loc = np.vstack(loc)
         acq = np.vstack(acq)
         idx_best = np.argmin(acq)
-        x_new = loc[idx_best:idx_best+1,:]
+        best_val = np.min(acq)
+        id_prova = onp.argmin(acq)
+        best_prova = onp.min(acq)
+        x_new = loc[idx_best:idx_best + 1,:]
         return x_new, acq, loc
 
 
 
-    def fit_gmm(self, num_comp = 2, N_samples = 10000, **kwargs):
+    def fit_gmm(self, num_comp=2, N_samples=10000, **kwargs):
         bounds = kwargs['bounds']
         lb = bounds['lb']
         ub = bounds['ub']
@@ -509,23 +687,25 @@ class MultipleIndependentOutputsGP(GPmodel):
         rng_key = kwargs['rng_key']
         dim = lb.shape[0]
         # Sample data across the entire domain
-        X = lb + (ub-lb)*lhs(dim, N_samples)
+        X = lb + (ub - lb) * lhs(dim, N_samples)
 
         # set the seed for sampling X
         onp.random.seed(rng_key[0])
-        X = lb + (ub-lb)*lhs(dim, N_samples)
+        X = lb + (ub - lb) * lhs(dim, N_samples)
 
-        # We only keep the first row that correspond to the objective prediction and same for y_samples
-        y = self.predict(X, **kwargs)[0][0,:]
+        # We only keep the first row that correspond to the objective
+        # prediction and same for y_samples
+        prova = self.predict_all(X, **kwargs)
+        y = self.predict_all(X, **kwargs)[0][0,:] #era: predict
 
         # Prediction of the constraints
-        mu, std = self.predict(X, **kwargs)
+        mu, std = self.predict_all(X, **kwargs)
         mu_c, std_c = mu[1:,:], std[1:,:]
 
         #print('mu_c', 'std_c', mu_c.shape, std_c.shape)
         constraint_w = np.ones((std_c.shape[1],1)).flatten()
         for k in range(std_c.shape[0]):
-            constraint_w_temp = norm.cdf(mu_c[k,:]/std_c[k,:])
+            constraint_w_temp = norm.cdf(mu_c[k,:] / std_c[k,:])
             if np.sum(constraint_w_temp) > 1e-8:
                 constraint_w = constraint_w * constraint_w_temp
         #print("constraint_w", constraint_w.shape)
@@ -534,8 +714,8 @@ class MultipleIndependentOutputsGP(GPmodel):
         rng_key = random.split(rng_key)[0]
         onp.random.seed(rng_key[0])
 
-        X_samples = lb + (ub-lb)*lhs(dim, N_samples)
-        y_samples = self.predict(X_samples, **kwargs)[0][0,:]
+        X_samples = lb + (ub - lb) * lhs(dim, N_samples)
+        y_samples = self.predict_all(X_samples, **kwargs)[0][0,:]
 
 
         # Compute p_x and p_y from samples across the entire domain
@@ -545,7 +725,7 @@ class MultipleIndependentOutputsGP(GPmodel):
         p_y = utils.fit_kernel_density(y_samples, y, weights = p_x_samples)
 
         #print("constraint_w", constraint_w.shape, "p_x", p_x.shape)
-        weights = p_x/p_y*constraint_w
+        weights = p_x / p_y * constraint_w
         # Label each input data
         indices = np.arange(N_samples)
         # Scale inputs to [0, 1]^D
@@ -568,7 +748,7 @@ class MultipleIndependentOutputsGP(GPmodel):
     @partial(jit, static_argnums=(0,))
     def draw_posterior_sample(self, X_star, **kwargs):
         sample_list = []
-        params_list =  kwargs['params']
+        params_list = kwargs['params']
         batch_list = kwargs['batch']
         bounds = kwargs['bounds']
         norm_const_list = kwargs['norm_const']
@@ -576,18 +756,18 @@ class MultipleIndependentOutputsGP(GPmodel):
         zipped_args = zip(params_list, batch_list, norm_const_list, rng_key_list)
         for i, (params, batch, norm_const, rng_key) in enumerate(zipped_args):
             # Normalize to [0,1]
-            X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+            X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
             # Fetch normalized training data
             X, y = batch['X'], batch['y']
             # Fetch params
             sigma_n = np.exp(params[-1])
             theta = np.exp(params[:-1])
             # Compute kernels
-            k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0])*(sigma_n + 1e-8)
+            k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0]) * (sigma_n + 1e-8)
             k_pX = self.kernel(X_star, X, theta)
             L = self.compute_cholesky(params, batch)
             alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-            beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+            beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
             # Compute predictive mean
             mu = np.matmul(k_pX, alpha)
             cov = k_pp - np.matmul(k_pX, beta)
@@ -625,11 +805,11 @@ class ManifoldGP(GPmodel):
         sigma_n = np.exp(gp_params[-1])
         theta = np.exp(gp_params[:-1])
         # Compute kernel
-        K = self.kernel(X, X, theta) + np.eye(N)*(sigma_n + 1e-8)
+        K = self.kernel(X, X, theta) + np.eye(N) * (sigma_n + 1e-8)
         L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch, rng_key, num_restarts = 10):
+    def train(self, batch, rng_key, num_restarts=10):
         # Define objective that returns NumPy arrays
         def objective(params):
             value, grads = self.likelihood_value_and_grad(params, batch)
@@ -665,7 +845,7 @@ class ManifoldGP(GPmodel):
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         X, y = batch['X'], batch['y']
         # Warp inputs
@@ -677,11 +857,11 @@ class ManifoldGP(GPmodel):
         sigma_n = np.exp(gp_params[-1])
         theta = np.exp(gp_params[:-1])
         # Compute kernels
-        k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0])*(sigma_n + 1e-8)
+        k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0]) * (sigma_n + 1e-8)
         k_pX = self.kernel(X_star, X, theta)
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -689,7 +869,8 @@ class ManifoldGP(GPmodel):
 
         return mu, std
 
-# A minimal ManifoldGP with Multiple Outputs regression class (inherits from GPmodel)
+# A minimal ManifoldGP with Multiple Outputs regression class (inherits from
+# GPmodel)
 class ManifoldGP_MultiOutputs(GPmodel):
     # Initialize the class
     def __init__(self, options, layers):
@@ -715,11 +896,11 @@ class ManifoldGP_MultiOutputs(GPmodel):
         sigma_n = np.exp(gp_params[-1])
         theta = np.exp(gp_params[:-1])
         # Compute kernel
-        K = self.kernel(X, X, theta) + np.eye(N)*(sigma_n + 1e-8)
+        K = self.kernel(X, X, theta) + np.eye(N) * (sigma_n + 1e-8)
         L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch_list, rng_key, num_restarts = 10):
+    def train(self, batch_list, rng_key, num_restarts=10):
         best_params = []
         for _, batch in enumerate(batch_list):
             # Define objective that returns NumPy arrays
@@ -755,13 +936,13 @@ class ManifoldGP_MultiOutputs(GPmodel):
         mu_list = []
         std_list = []
         
-        params_list =  kwargs['params']
+        params_list = kwargs['params']
         batch_list = kwargs['batch']
         bounds = kwargs['bounds']
         norm_const_list = kwargs['norm_const']
         zipped_args = zip(params_list, batch_list, norm_const_list)
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         
         for k, (params, batch, norm_const) in enumerate(zipped_args):
             # Fetch normalized training data
@@ -775,11 +956,11 @@ class ManifoldGP_MultiOutputs(GPmodel):
             sigma_n = np.exp(gp_params[-1])
             theta = np.exp(gp_params[:-1])
             # Compute kernels
-            k_pp = self.kernel(X_star_nn, X_star_nn, theta) + np.eye(X_star_nn.shape[0])*(sigma_n + 1e-8)
+            k_pp = self.kernel(X_star_nn, X_star_nn, theta) + np.eye(X_star_nn.shape[0]) * (sigma_n + 1e-8)
             k_pX = self.kernel(X_star_nn, X, theta)
             L = self.compute_cholesky(params, batch)
             alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-            beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+            beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
             # Compute predictive mean, std
             mu = np.matmul(k_pX, alpha)
             cov = k_pp - np.matmul(k_pX, beta)
@@ -793,12 +974,12 @@ class ManifoldGP_MultiOutputs(GPmodel):
     @partial(jit, static_argnums=(0,))
     def predict(self, X_star, **kwargs):
         
-        params =  kwargs['params']
+        params = kwargs['params']
         batch = kwargs['batch']
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         
         # Fetch normalized training data
         X, y = batch['X'], batch['y']
@@ -811,11 +992,11 @@ class ManifoldGP_MultiOutputs(GPmodel):
         sigma_n = np.exp(gp_params[-1])
         theta = np.exp(gp_params[:-1])
         # Compute kernels
-        k_pp = self.kernel(X_star_nn, X_star_nn, theta) + np.eye(X_star_nn.shape[0])*(sigma_n + 1e-8)
+        k_pp = self.kernel(X_star_nn, X_star_nn, theta) + np.eye(X_star_nn.shape[0]) * (sigma_n + 1e-8)
         k_pX = self.kernel(X_star_nn, X, theta)
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -833,15 +1014,18 @@ class ManifoldGP_MultiOutputs(GPmodel):
             return acquisitions.EIC(mean, std, best)
         elif self.options['constrained_criterion'] == 'LCBC':
             kappa = kwargs['kappa']
-            ##### normalize the mean and std again and subtract the mean by 2*sigma
+            ##### normalize the mean and std again and subtract the mean by
+            ##### 2*sigma
             #norm_const = kwargs['norm_const'][0]
-            #mean[0,:] = (mean[0,:] - norm_const['mu_y']) / norm_const['sigma_y'] - 3 * norm_const['sigma_y']
+            #mean[0,:] = (mean[0,:] - norm_const['mu_y']) /
+            #norm_const['sigma_y'] - 3 * norm_const['sigma_y']
             #std[0,:] = std[0,:] / norm_const['sigma_y']
             #####
             return acquisitions.LCBC(mean, std, kappa)
         elif self.options['constrained_criterion'] == 'LW_LCBC':
             kappa = kwargs['kappa']
-            ##### normalize the mean and std again and subtract the mean by 3*sigma
+            ##### normalize the mean and std again and subtract the mean by
+            ##### 3*sigma
             weights = utils.compute_w_gmm(x, **kwargs)
             return acquisitions.LW_LCBC(mean, std, weights, kappa)
         else:
@@ -854,7 +1038,7 @@ class ManifoldGP_MultiOutputs(GPmodel):
         grads = f_vjp(np.ones_like(primals))[0]
         return primals, grads
 
-    def constrained_compute_next_point_lbfgs(self, num_restarts = 10, **kwargs):
+    def constrained_compute_next_point_lbfgs(self, num_restarts=10, **kwargs):
         # Define objective that returns NumPy arrays
         def objective(x):
             value, grads = self.constrained_acq_value_and_grad(x, **kwargs)
@@ -870,7 +1054,7 @@ class ManifoldGP_MultiOutputs(GPmodel):
         dim = lb.shape[0]
 
         onp.random.seed(rng_key[0])
-        x0 = lb + (ub-lb)*lhs(dim, num_restarts)
+        x0 = lb + (ub - lb) * lhs(dim, num_restarts)
         #print("x0 for bfgs", x0)
         dom_bounds = tuple(map(tuple, np.vstack((lb, ub)).T))
         for i in range(num_restarts):
@@ -880,8 +1064,8 @@ class ManifoldGP_MultiOutputs(GPmodel):
         loc = np.vstack(loc)
         acq = np.vstack(acq)
         idx_best = np.argmin(acq)
-        x_new = loc[idx_best:idx_best+1,:]
-        return x_new, acq, loc
+        x_new = loc[idx_best:idx_best + 1,:]
+        return x_new, acq , loc
     
     
 
@@ -900,19 +1084,19 @@ class MultifidelityGP(GPmodel):
         rho = params[-3]
         sigma_n_L = np.exp(params[-2])
         sigma_n_H = np.exp(params[-1])
-        theta_L = np.exp(params[:D+1])
-        theta_H = np.exp(params[D+1:-3])
+        theta_L = np.exp(params[:D + 1])
+        theta_H = np.exp(params[D + 1:-3])
         # Compute kernels
-        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL)*(sigma_n_L + 1e-8)
-        K_LH = rho*self.kernel(XL, XH, theta_L)
-        K_HH = rho**2 * self.kernel(XH, XH, theta_L) + \
-                        self.kernel(XH, XH, theta_H) + np.eye(NH)*(sigma_n_H + 1e-8)
+        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL) * (sigma_n_L + 1e-8)
+        K_LH = rho * self.kernel(XL, XH, theta_L)
+        K_HH = rho ** 2 * self.kernel(XH, XH, theta_L) + \
+                        self.kernel(XH, XH, theta_H) + np.eye(NH) * (sigma_n_H + 1e-8)
         K = np.vstack((np.hstack((K_LL,K_LH)),
                        np.hstack((K_LH.T,K_HH))))
         L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch, rng_key, num_restarts = 10):
+    def train(self, batch, rng_key, num_restarts=10):
         # Define objective that returns NumPy arrays
         def objective(params):
             value, grads = self.likelihood_value_and_grad(params, batch)
@@ -945,7 +1129,7 @@ class MultifidelityGP(GPmodel):
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         XL, XH = batch['XL'], batch['XH']
         D = batch['XH'].shape[1]
@@ -954,19 +1138,19 @@ class MultifidelityGP(GPmodel):
         rho = params[-3]
         sigma_n_L = np.exp(params[-2])
         sigma_n_H = np.exp(params[-1])
-        theta_L = np.exp(params[:D+1])
-        theta_H = np.exp(params[D+1:-3])
+        theta_L = np.exp(params[:D + 1])
+        theta_H = np.exp(params[D + 1:-3])
         # Compute kernels
-        k_pp = rho**2 * self.kernel(X_star, X_star, theta_L) + \
+        k_pp = rho ** 2 * self.kernel(X_star, X_star, theta_L) + \
                         self.kernel(X_star, X_star, theta_H) + \
-                        np.eye(X_star.shape[0])*(sigma_n_H + 1e-8)
-        psi1 = rho*self.kernel(X_star, XL, theta_L)
-        psi2 = rho**2 * self.kernel(X_star, XH, theta_L) + \
+                        np.eye(X_star.shape[0]) * (sigma_n_H + 1e-8)
+        psi1 = rho * self.kernel(X_star, XL, theta_L)
+        psi2 = rho ** 2 * self.kernel(X_star, XH, theta_L) + \
                         self.kernel(X_star, XH, theta_H)
         k_pX = np.hstack((psi1,psi2))
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -980,7 +1164,7 @@ class MultifidelityGP(GPmodel):
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         XL, XH = batch['XL'], batch['XH']
         D = batch['XH'].shape[1]
@@ -989,17 +1173,17 @@ class MultifidelityGP(GPmodel):
         rho = params[-3]
         sigma_n_L = np.exp(params[-2])
         sigma_n_H = np.exp(params[-1])
-        theta_L = np.exp(params[:D+1])
-        theta_H = np.exp(params[D+1:-3])
+        theta_L = np.exp(params[:D + 1])
+        theta_H = np.exp(params[D + 1:-3])
         # Compute kernels
         k_pp = self.kernel(X_star, X_star, theta_L) + \
-               np.eye(X_star.shape[0])*(sigma_n_L + 1e-8)
+               np.eye(X_star.shape[0]) * (sigma_n_L + 1e-8)
         psi1 = self.kernel(X_star, XL, theta_L)
-        psi1 = rho*self.kernel(X_star, XH, theta_L)
+        psi1 = rho * self.kernel(X_star, XH, theta_L)
         k_pX = np.hstack((psi1,psi2))
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -1007,14 +1191,14 @@ class MultifidelityGP(GPmodel):
         return mu, std
     
     @partial(jit, static_argnums=(0,))
-    def posterior_covariance_L(self, x, xp **kwargs):
+    def posterior_covariance_L(self, x, xp, **kwargs):
         params = kwargs['params']
         batch = kwargs['batch']
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        x = (x - bounds['lb'])/(bounds['ub'] - bounds['lb'])
-        xp = (xp - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        x = (x - bounds['lb']) / (bounds['ub'] - bounds['lb'])
+        xp = (xp - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         XL, XH = batch['XL'], batch['XH']
         D = batch['XH'].shape[1]
@@ -1023,31 +1207,31 @@ class MultifidelityGP(GPmodel):
         rho = params[-3]
         sigma_n_L = np.exp(params[-2])
         sigma_n_H = np.exp(params[-1])
-        theta_L = np.exp(params[:D+1])
-        theta_H = np.exp(params[D+1:-3])
+        theta_L = np.exp(params[:D + 1])
+        theta_H = np.exp(params[D + 1:-3])
         # Compute kernels
         k_pp = self.kernel(x, xp, theta_L)
         psi1 = self.kernel(x, XL, theta_L)
-        psi2 = rho*self.kernel(x, XH, theta_L)
+        psi2 = rho * self.kernel(x, XH, theta_L)
         k_pX = np.hstack((psi1,psi2))
         psi1 = self.kernel(XL, xp, theta_L)
-        psi2 = rho*self.kernel(XH, xp, theta_L)
+        psi2 = rho * self.kernel(XH, xp, theta_L)
         k_Xp = np.hstack((psi1,psi2))
         L = self.compute_cholesky(params, batch)
         # Compute predictive mean, std
-        beta  = solve_triangular(L.T,solve_triangular(L, k_Xp, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_Xp, lower=True))
         cov = k_pp - np.matmul(k_pX, beta)
         return cov
     
     @partial(jit, static_argnums=(0,))
-    def posterior_covariance_H(self, x, xp **kwargs):
+    def posterior_covariance_H(self, x, xp, **kwargs):
         params = kwargs['params']
         batch = kwargs['batch']
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        x = (x - bounds['lb'])/(bounds['ub'] - bounds['lb'])
-        xp = (xp - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        x = (x - bounds['lb']) / (bounds['ub'] - bounds['lb'])
+        xp = (xp - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         XL, XH = batch['XL'], batch['XH']
         D = batch['XH'].shape[1]
@@ -1056,22 +1240,22 @@ class MultifidelityGP(GPmodel):
         rho = params[-3]
         sigma_n_L = np.exp(params[-2])
         sigma_n_H = np.exp(params[-1])
-        theta_L = np.exp(params[:D+1])
-        theta_H = np.exp(params[D+1:-3])
+        theta_L = np.exp(params[:D + 1])
+        theta_H = np.exp(params[D + 1:-3])
         # Compute kernels
-        k_pp = rho**2 * self.kernel(x, xp, theta_L) + \
+        k_pp = rho ** 2 * self.kernel(x, xp, theta_L) + \
                         self.kernel(x, xp, theta_H)
-        psi1 = rho*self.kernel(x, XL, theta_L)
-        psi2 = rho**2 * self.kernel(x, XH, theta_L) + \
+        psi1 = rho * self.kernel(x, XL, theta_L)
+        psi2 = rho ** 2 * self.kernel(x, XH, theta_L) + \
                         self.kernel(x, XH, theta_H)
         k_pX = np.hstack((psi1,psi2))
-        psi1 = rho*self.kernel(XL, xp, theta_L)
-        psi2 = rho**2 * self.kernel(XH, xp, theta_L) + \
+        psi1 = rho * self.kernel(XL, xp, theta_L)
+        psi2 = rho ** 2 * self.kernel(XH, xp, theta_L) + \
                         self.kernel(XH, xp, theta_H)
         k_Xp = np.hstack((psi1,psi2))
         L = self.compute_cholesky(params, batch)
         # Compute predictive mean, std
-        beta  = solve_triangular(L.T,solve_triangular(L, k_Xp, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_Xp, lower=True))
         cov = k_pp - np.matmul(k_pX, beta)
         return cov
     
@@ -1113,19 +1297,19 @@ class DeepMultifidelityGP(GPmodel):
         rho = gp_params[-3]
         sigma_n_L = np.exp(gp_params[-2])
         sigma_n_H = np.exp(gp_params[-1])
-        theta_L = np.exp(gp_params[:D+1])
-        theta_H = np.exp(gp_params[D+1:-3])
+        theta_L = np.exp(gp_params[:D + 1])
+        theta_H = np.exp(gp_params[D + 1:-3])
         # Compute kernels
-        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL)*(sigma_n_L + 1e-8)
-        K_LH = rho*self.kernel(XL, XH, theta_L)
-        K_HH = rho**2 * self.kernel(XH, XH, theta_L) + \
-                        self.kernel(XH, XH, theta_H) + np.eye(NH)*(sigma_n_H + 1e-8)
+        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL) * (sigma_n_L + 1e-8)
+        K_LH = rho * self.kernel(XL, XH, theta_L)
+        K_HH = rho ** 2 * self.kernel(XH, XH, theta_L) + \
+                        self.kernel(XH, XH, theta_H) + np.eye(NH) * (sigma_n_H + 1e-8)
         K = np.vstack((np.hstack((K_LL,K_LH)),
                        np.hstack((K_LH.T,K_HH))))
         L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch, rng_key, num_restarts = 10, verbose=False, maxfun=15000):
+    def train(self, batch, rng_key, num_restarts=10, verbose=False, maxfun=15000):
         # Define objective that returns NumPy arrays
         def objective(params):
             value, grads = self.likelihood_value_and_grad(params, batch)
@@ -1166,7 +1350,7 @@ class DeepMultifidelityGP(GPmodel):
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         XL, XH = batch['XL'], batch['XH']
         y = batch['y']
@@ -1181,19 +1365,19 @@ class DeepMultifidelityGP(GPmodel):
         rho = gp_params[-3]
         sigma_n_L = np.exp(gp_params[-2])
         sigma_n_H = np.exp(gp_params[-1])
-        theta_L = np.exp(gp_params[:D+1])
-        theta_H = np.exp(gp_params[D+1:-3])
+        theta_L = np.exp(gp_params[:D + 1])
+        theta_H = np.exp(gp_params[D + 1:-3])
         # Compute kernels
-        k_pp = rho**2 * self.kernel(X_star, X_star, theta_L) + \
+        k_pp = rho ** 2 * self.kernel(X_star, X_star, theta_L) + \
                         self.kernel(X_star, X_star, theta_H) + \
-                        np.eye(X_star.shape[0])*(sigma_n_H + 1e-8)
-        psi1 = rho*self.kernel(X_star, XL, theta_L)
-        psi2 = rho**2 * self.kernel(X_star, XH, theta_L) + \
+                        np.eye(X_star.shape[0]) * (sigma_n_H + 1e-8)
+        psi1 = rho * self.kernel(X_star, XL, theta_L)
+        psi2 = rho ** 2 * self.kernel(X_star, XH, theta_L) + \
                         self.kernel(X_star, XH, theta_H)
         k_pX = np.hstack((psi1,psi2))
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -1201,7 +1385,8 @@ class DeepMultifidelityGP(GPmodel):
 
         return mu, std
 
-# A minimal DeepMultifidelityGP with Multiple Outputs regression class (inherits from GPmodel)
+# A minimal DeepMultifidelityGP with Multiple Outputs regression class
+# (inherits from GPmodel)
 class DeepMultifidelityGP_MultiOutputs(GPmodel):
     # Initialize the class
     def __init__(self, options, layers):
@@ -1237,19 +1422,19 @@ class DeepMultifidelityGP_MultiOutputs(GPmodel):
         rho = gp_params[-3]
         sigma_n_L = np.exp(gp_params[-2])
         sigma_n_H = np.exp(gp_params[-1])
-        theta_L = np.exp(gp_params[:D+1])
-        theta_H = np.exp(gp_params[D+1:-3])
+        theta_L = np.exp(gp_params[:D + 1])
+        theta_H = np.exp(gp_params[D + 1:-3])
         # Compute kernels
-        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL)*(sigma_n_L + 1e-8)
-        K_LH = rho*self.kernel(XL, XH, theta_L)
-        K_HH = rho**2 * self.kernel(XH, XH, theta_L) + \
-                        self.kernel(XH, XH, theta_H) + np.eye(NH)*(sigma_n_H + 1e-8)
+        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL) * (sigma_n_L + 1e-8)
+        K_LH = rho * self.kernel(XL, XH, theta_L)
+        K_HH = rho ** 2 * self.kernel(XH, XH, theta_L) + \
+                        self.kernel(XH, XH, theta_H) + np.eye(NH) * (sigma_n_H + 1e-8)
         K = np.vstack((np.hstack((K_LL,K_LH)),
                        np.hstack((K_LH.T,K_HH))))
         L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch_list, rng_key, num_restarts = 10, verbose=False, maxfun=15000):
+    def train(self, batch_list, rng_key, num_restarts=10, verbose=False, maxfun=15000):
         best_params = []
         for _, batch in enumerate(batch_list):
             # Define objective that returns NumPy arrays
@@ -1290,13 +1475,13 @@ class DeepMultifidelityGP_MultiOutputs(GPmodel):
         mu_list = []
         std_list = []
         
-        params_list =  kwargs['params']
+        params_list = kwargs['params']
         batch_list = kwargs['batch']
         bounds = kwargs['bounds']
         norm_const_list = kwargs['norm_const']
         zipped_args = zip(params_list, batch_list, norm_const_list)
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         
         for k, (params, batch, norm_const) in enumerate(zipped_args):
             # Fetch normalized training data
@@ -1313,19 +1498,19 @@ class DeepMultifidelityGP_MultiOutputs(GPmodel):
             rho = gp_params[-3]
             sigma_n_L = np.exp(gp_params[-2])
             sigma_n_H = np.exp(gp_params[-1])
-            theta_L = np.exp(gp_params[:D+1])
-            theta_H = np.exp(gp_params[D+1:-3])
+            theta_L = np.exp(gp_params[:D + 1])
+            theta_H = np.exp(gp_params[D + 1:-3])
             # Compute kernels
-            k_pp = rho**2 * self.kernel(X_star_nn, X_star_nn, theta_L) + \
+            k_pp = rho ** 2 * self.kernel(X_star_nn, X_star_nn, theta_L) + \
                             self.kernel(X_star_nn, X_star_nn, theta_H) + \
-                            np.eye(X_star_nn.shape[0])*(sigma_n_H + 1e-8)
-            psi1 = rho*self.kernel(X_star_nn, XL, theta_L)
-            psi2 = rho**2 * self.kernel(X_star_nn, XH, theta_L) + \
+                            np.eye(X_star_nn.shape[0]) * (sigma_n_H + 1e-8)
+            psi1 = rho * self.kernel(X_star_nn, XL, theta_L)
+            psi2 = rho ** 2 * self.kernel(X_star_nn, XH, theta_L) + \
                             self.kernel(X_star_nn, XH, theta_H)
             k_pX = np.hstack((psi1,psi2))
             L = self.compute_cholesky(params, batch)
             alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-            beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+            beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
             # Compute predictive mean, std
             mu = np.matmul(k_pX, alpha)
             cov = k_pp - np.matmul(k_pX, beta)
@@ -1338,12 +1523,12 @@ class DeepMultifidelityGP_MultiOutputs(GPmodel):
     
     @partial(jit, static_argnums=(0,))
     def predict(self, X_star, **kwargs):
-        params =  kwargs['params']
+        params = kwargs['params']
         batch = kwargs['batch']
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         
         # Fetch normalized training data
         XL, XH = batch['XL'], batch['XH']
@@ -1359,19 +1544,19 @@ class DeepMultifidelityGP_MultiOutputs(GPmodel):
         rho = gp_params[-3]
         sigma_n_L = np.exp(gp_params[-2])
         sigma_n_H = np.exp(gp_params[-1])
-        theta_L = np.exp(gp_params[:D+1])
-        theta_H = np.exp(gp_params[D+1:-3])
+        theta_L = np.exp(gp_params[:D + 1])
+        theta_H = np.exp(gp_params[D + 1:-3])
         # Compute kernels
-        k_pp = rho**2 * self.kernel(X_star_nn, X_star_nn, theta_L) + \
+        k_pp = rho ** 2 * self.kernel(X_star_nn, X_star_nn, theta_L) + \
                         self.kernel(X_star_nn, X_star_nn, theta_H) + \
-                        np.eye(X_star_nn.shape[0])*(sigma_n_H + 1e-8)
-        psi1 = rho*self.kernel(X_star_nn, XL, theta_L)
-        psi2 = rho**2 * self.kernel(X_star_nn, XH, theta_L) + \
+                        np.eye(X_star_nn.shape[0]) * (sigma_n_H + 1e-8)
+        psi1 = rho * self.kernel(X_star_nn, XL, theta_L)
+        psi2 = rho ** 2 * self.kernel(X_star_nn, XH, theta_L) + \
                         self.kernel(X_star_nn, XH, theta_H)
         k_pX = np.hstack((psi1,psi2))
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -1389,15 +1574,18 @@ class DeepMultifidelityGP_MultiOutputs(GPmodel):
             return acquisitions.EIC(mean, std, best)
         elif self.options['constrained_criterion'] == 'LCBC':
             kappa = kwargs['kappa']
-            ##### normalize the mean and std again and subtract the mean by 2*sigma
+            ##### normalize the mean and std again and subtract the mean by
+            ##### 2*sigma
             #norm_const = kwargs['norm_const'][0]
-            #mean[0,:] = (mean[0,:] - norm_const['mu_y']) / norm_const['sigma_y'] - 3 * norm_const['sigma_y']
+            #mean[0,:] = (mean[0,:] - norm_const['mu_y']) /
+            #norm_const['sigma_y'] - 3 * norm_const['sigma_y']
             #std[0,:] = std[0,:] / norm_const['sigma_y']
             #####
             return acquisitions.LCBC(mean, std, kappa)
         elif self.options['constrained_criterion'] == 'LW_LCBC':
             kappa = kwargs['kappa']
-            ##### normalize the mean and std again and subtract the mean by 3*sigma
+            ##### normalize the mean and std again and subtract the mean by
+            ##### 3*sigma
             weights = utils.compute_w_gmm(x, **kwargs)
             return acquisitions.LW_LCBC(mean, std, weights, kappa)
         else:
@@ -1410,7 +1598,7 @@ class DeepMultifidelityGP_MultiOutputs(GPmodel):
         grads = f_vjp(np.ones_like(primals))[0]
         return primals, grads
 
-    def constrained_compute_next_point_lbfgs(self, num_restarts = 10, **kwargs):
+    def constrained_compute_next_point_lbfgs(self, num_restarts=10, **kwargs):
         # Define objective that returns NumPy arrays
         def objective(x):
             value, grads = self.constrained_acq_value_and_grad(x, **kwargs)
@@ -1426,7 +1614,7 @@ class DeepMultifidelityGP_MultiOutputs(GPmodel):
         dim = lb.shape[0]
 
         onp.random.seed(rng_key[0])
-        x0 = lb + (ub-lb)*lhs(dim, num_restarts)
+        x0 = lb + (ub - lb) * lhs(dim, num_restarts)
         #print("x0 for bfgs", x0)
         dom_bounds = tuple(map(tuple, np.vstack((lb, ub)).T))
         for i in range(num_restarts):
@@ -1436,7 +1624,7 @@ class DeepMultifidelityGP_MultiOutputs(GPmodel):
         loc = np.vstack(loc)
         acq = np.vstack(acq)
         idx_best = np.argmin(acq)
-        x_new = loc[idx_best:idx_best+1,:]
+        x_new = loc[idx_best:idx_best + 1,:]
         return x_new, acq, loc
     
 # A minimal GradientGP regression class (inherits from GPmodel)
@@ -1466,15 +1654,15 @@ class GradientGP(GPmodel):
         sigma_n_G = np.exp(params[-1])
         theta = np.exp(params[:-2])
         # Compute kernels
-        K_FF = self.kernel(XF, XF, theta) + np.eye(NF)*(sigma_n_F + 1e-8)
+        K_FF = self.kernel(XF, XF, theta) + np.eye(NF) * (sigma_n_F + 1e-8)
         K_FG = self.k_dx2(XF, XG, theta)
-        K_GG = self.k_dx1dx2(XG, XG, theta) + np.eye(NG)*(sigma_n_G + 1e-8)
+        K_GG = self.k_dx1dx2(XG, XG, theta) + np.eye(NG) * (sigma_n_G + 1e-8)
         K = np.vstack((np.hstack((K_FF,K_FG)),
                        np.hstack((K_FG.T,K_GG))))
         L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch, rng_key, num_restarts = 10):
+    def train(self, batch, rng_key, num_restarts=10):
         # Define objective that returns NumPy arrays
         def objective(params):
             value, grads = self.likelihood_value_and_grad(params, batch)
@@ -1515,13 +1703,13 @@ class GradientGP(GPmodel):
         sigma_n_G = np.exp(params[-1])
         theta = np.exp(params[:-2])
         # Compute kernels
-        k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0])*(sigma_n_F + 1e-8)
+        k_pp = self.kernel(X_star, X_star, theta) + np.eye(X_star.shape[0]) * (sigma_n_F + 1e-8)
         psi1 = self.kernel(X_star, XF, theta)
         psi2 = self.k_dx2(X_star, XG, theta)
         k_pX = np.hstack((psi1,psi2))
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -1546,19 +1734,19 @@ class MultipleIndependentMFGP(GPmodel):
         rho = params[-3]
         sigma_n_L = np.exp(params[-2])
         sigma_n_H = np.exp(params[-1])
-        theta_L = np.exp(params[:D+1])
-        theta_H = np.exp(params[D+1:-3])
+        theta_L = np.exp(params[:D + 1])
+        theta_H = np.exp(params[D + 1:-3])
         # Compute kernels
-        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL)*(sigma_n_L + 1e-8)
-        K_LH = rho*self.kernel(XL, XH, theta_L)
-        K_HH = rho**2 * self.kernel(XH, XH, theta_L) + \
-                        self.kernel(XH, XH, theta_H) + np.eye(NH)*(sigma_n_H + 1e-8)
+        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL) * (sigma_n_L + 1e-8)
+        K_LH = rho * self.kernel(XL, XH, theta_L)
+        K_HH = rho ** 2 * self.kernel(XH, XH, theta_L) + \
+                        self.kernel(XH, XH, theta_H) + np.eye(NH) * (sigma_n_H + 1e-8)
         K = np.vstack((np.hstack((K_LL,K_LH)),
                        np.hstack((K_LH.T,K_HH))))
         L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch_list, rng_key, num_restarts = 10):
+    def train(self, batch_list, rng_key, num_restarts=10):
         best_params = []
         for _, batch in enumerate(batch_list):
             # Define objective that returns NumPy arrays
@@ -1592,13 +1780,14 @@ class MultipleIndependentMFGP(GPmodel):
     def predict_all(self, X_star, **kwargs):
         mu_list = []
         std_list = []
-        params_list =  kwargs['params']
+        params_list = kwargs['params']
         batch_list = kwargs['batch']
         bounds = kwargs['bounds']
         norm_const_list = kwargs['norm_const']
         zipped_args = zip(params_list, batch_list, norm_const_list)
-        # Normalize to [0,1] (We should do this for once instead of iteratively doing so in the for loop)
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        # Normalize to [0,1] (We should do this for once instead of iteratively
+        # doing so in the for loop)
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
 
         for k, (params, batch, norm_const) in enumerate(zipped_args):
             # Fetch normalized training data
@@ -1609,26 +1798,26 @@ class MultipleIndependentMFGP(GPmodel):
             rho = params[-3]
             sigma_n_L = np.exp(params[-2])
             sigma_n_H = np.exp(params[-1])
-            theta_L = np.exp(params[:D+1])
-            theta_H = np.exp(params[D+1:-3])
+            theta_L = np.exp(params[:D + 1])
+            theta_H = np.exp(params[D + 1:-3])
             # Compute kernels
-            k_pp = rho**2 * self.kernel(X_star, X_star, theta_L) + \
+            k_pp = rho ** 2 * self.kernel(X_star, X_star, theta_L) + \
                             self.kernel(X_star, X_star, theta_H) + \
-                            np.eye(X_star.shape[0])*(sigma_n_H + 1e-8)
-            psi1 = rho*self.kernel(X_star, XL, theta_L)
-            psi2 = rho**2 * self.kernel(X_star, XH, theta_L) + \
+                            np.eye(X_star.shape[0]) * (sigma_n_H + 1e-8)
+            psi1 = rho * self.kernel(X_star, XL, theta_L)
+            psi2 = rho ** 2 * self.kernel(X_star, XH, theta_L) + \
                             self.kernel(X_star, XH, theta_H)
             k_pX = np.hstack((psi1,psi2))
             L = self.compute_cholesky(params, batch)
             alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-            beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+            beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
             # Compute predictive mean, std
             mu = np.matmul(k_pX, alpha)
             cov = k_pp - np.matmul(k_pX, beta)
             std = np.sqrt(np.clip(np.diag(cov), a_min=0.))
             if k > 0:
-                mu = mu*norm_const['sigma_y'] + norm_const['mu_y']
-                std = std*norm_const['sigma_y']
+                mu = mu * norm_const['sigma_y'] + norm_const['mu_y']
+                std = std * norm_const['sigma_y']
             mu_list.append(mu)
             std_list.append(std)
         return np.array(mu_list), np.array(std_list)
@@ -1640,7 +1829,7 @@ class MultipleIndependentMFGP(GPmodel):
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         XL, XH = batch['XL'], batch['XH']
         D = batch['XH'].shape[1]
@@ -1649,19 +1838,19 @@ class MultipleIndependentMFGP(GPmodel):
         rho = params[-3]
         sigma_n_L = np.exp(params[-2])
         sigma_n_H = np.exp(params[-1])
-        theta_L = np.exp(params[:D+1])
-        theta_H = np.exp(params[D+1:-3])
+        theta_L = np.exp(params[:D + 1])
+        theta_H = np.exp(params[D + 1:-3])
         # Compute kernels
-        k_pp = rho**2 * self.kernel(X_star, X_star, theta_L) + \
+        k_pp = rho ** 2 * self.kernel(X_star, X_star, theta_L) + \
                         self.kernel(X_star, X_star, theta_H) + \
-                        np.eye(X_star.shape[0])*(sigma_n_H + 1e-8)
-        psi1 = rho*self.kernel(X_star, XL, theta_L)
-        psi2 = rho**2 * self.kernel(X_star, XH, theta_L) + \
+                        np.eye(X_star.shape[0]) * (sigma_n_H + 1e-8)
+        psi1 = rho * self.kernel(X_star, XL, theta_L)
+        psi2 = rho ** 2 * self.kernel(X_star, XH, theta_L) + \
                         self.kernel(X_star, XH, theta_H)
         k_pX = np.hstack((psi1,psi2))
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -1680,15 +1869,18 @@ class MultipleIndependentMFGP(GPmodel):
             return acquisitions.EIC(mean, std, best)
         elif self.options['constrained_criterion'] == 'LCBC':
             kappa = kwargs['kappa']
-            ##### normalize the mean and std again and subtract the mean by 2*sigma
+            ##### normalize the mean and std again and subtract the mean by
+            ##### 2*sigma
             #norm_const = kwargs['norm_const'][0]
-            #mean[0,:] = (mean[0,:] - norm_const['mu_y']) / norm_const['sigma_y'] - 3 * norm_const['sigma_y']
+            #mean[0,:] = (mean[0,:] - norm_const['mu_y']) /
+            #norm_const['sigma_y'] - 3 * norm_const['sigma_y']
             #std[0,:] = std[0,:] / norm_const['sigma_y']
             #####
             return acquisitions.LCBC(mean, std, kappa)
         elif self.options['constrained_criterion'] == 'LW_LCBC':
             kappa = kwargs['kappa']
-            ##### normalize the mean and std again and subtract the mean by 3*sigma
+            ##### normalize the mean and std again and subtract the mean by
+            ##### 3*sigma
             weights = utils.compute_w_gmm(x, **kwargs)
             return acquisitions.LW_LCBC(mean, std, weights, kappa)
         else:
@@ -1701,7 +1893,7 @@ class MultipleIndependentMFGP(GPmodel):
         grads = f_vjp(np.ones_like(primals))[0]
         return primals, grads
 
-    def constrained_compute_next_point_lbfgs(self, num_restarts = 10, **kwargs):
+    def constrained_compute_next_point_lbfgs(self, num_restarts=10, **kwargs):
         # Define objective that returns NumPy arrays
         def objective(x):
             value, grads = self.constrained_acq_value_and_grad(x, **kwargs)
@@ -1717,7 +1909,7 @@ class MultipleIndependentMFGP(GPmodel):
         dim = lb.shape[0]
 
         onp.random.seed(rng_key[0])
-        x0 = lb + (ub-lb)*lhs(dim, num_restarts)
+        x0 = lb + (ub - lb) * lhs(dim, num_restarts)
         #print("x0 for bfgs", x0)
         dom_bounds = tuple(map(tuple, np.vstack((lb, ub)).T))
         for i in range(num_restarts):
@@ -1727,12 +1919,12 @@ class MultipleIndependentMFGP(GPmodel):
         loc = np.vstack(loc)
         acq = np.vstack(acq)
         idx_best = np.argmin(acq)
-        x_new = loc[idx_best:idx_best+1,:]
+        x_new = loc[idx_best:idx_best + 1,:]
         return x_new, acq, loc
 
 
 
-    def fit_gmm(self, num_comp = 2, N_samples = 10000, **kwargs):
+    def fit_gmm(self, num_comp=2, N_samples=10000, **kwargs):
         bounds = kwargs['bounds']
         lb = bounds['lb']
         ub = bounds['ub']
@@ -1741,13 +1933,14 @@ class MultipleIndependentMFGP(GPmodel):
         rng_key = kwargs['rng_key']
         dim = lb.shape[0]
         # Sample data across the entire domain
-        X = lb + (ub-lb)*lhs(dim, N_samples)
+        X = lb + (ub - lb) * lhs(dim, N_samples)
 
         # set the seed for sampling X
         onp.random.seed(rng_key[0])
-        X = lb + (ub-lb)*lhs(dim, N_samples)
+        X = lb + (ub - lb) * lhs(dim, N_samples)
 
-        # We only keep the first row that correspond to the objective prediction and same for y_samples
+        # We only keep the first row that correspond to the objective
+        # prediction and same for y_samples
         y = self.predict_all(X, **kwargs)[0][0,:]
 
         # Prediction of the constraints
@@ -1757,7 +1950,7 @@ class MultipleIndependentMFGP(GPmodel):
         #print('mu_c', 'std_c', mu_c.shape, std_c.shape)
         constraint_w = np.ones((std_c.shape[1],1)).flatten()
         for k in range(std_c.shape[0]):
-            constraint_w_temp = norm.cdf(mu_c[k,:]/std_c[k,:])
+            constraint_w_temp = norm.cdf(mu_c[k,:] / std_c[k,:])
             if np.sum(constraint_w_temp) > 1e-8:
                 constraint_w = constraint_w * constraint_w_temp
         #print("constraint_w", constraint_w.shape)
@@ -1766,7 +1959,7 @@ class MultipleIndependentMFGP(GPmodel):
         rng_key = random.split(rng_key)[0]
         onp.random.seed(rng_key[0])
 
-        X_samples = lb + (ub-lb)*lhs(dim, N_samples)
+        X_samples = lb + (ub - lb) * lhs(dim, N_samples)
         y_samples = self.predict_all(X_samples, **kwargs)[0][0,:]
 
 
@@ -1777,7 +1970,7 @@ class MultipleIndependentMFGP(GPmodel):
         p_y = utils.fit_kernel_density(y_samples, y, weights = p_x_samples)
 
         #print("constraint_w", constraint_w.shape, "p_x", p_x.shape)
-        weights = p_x/p_y*constraint_w
+        weights = p_x / p_y * constraint_w
         # Label each input data
         indices = np.arange(N_samples)
         # Scale inputs to [0, 1]^D
@@ -1797,7 +1990,8 @@ class MultipleIndependentMFGP(GPmodel):
 
 
 
-# A minimal MultifidelityGP regression class for heterogeneous inputs (inherits from GPmodel)
+# A minimal MultifidelityGP regression class for heterogeneous inputs (inherits
+# from GPmodel)
 class HeterogeneousMultifidelityGP(GPmodel):
     # Initialize the class
     def __init__(self, options, layers):
@@ -1825,19 +2019,19 @@ class HeterogeneousMultifidelityGP(GPmodel):
         rho = gp_params[-3]
         sigma_n_L = np.exp(gp_params[-2])
         sigma_n_H = np.exp(gp_params[-1])
-        theta_L = gp_params[:D+1]
-        theta_H = gp_params[D+1:-3]
+        theta_L = gp_params[:D + 1]
+        theta_H = gp_params[D + 1:-3]
         # Compute kernels
-        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL)*(sigma_n_L + 1e-8)
-        K_LH = rho*self.kernel(XL, XH, theta_L)
-        K_HH = rho**2 * self.kernel(XH, XH, theta_L) + \
-                        self.kernel(XH, XH, theta_H) + np.eye(NH)*(sigma_n_H + 1e-8)
+        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL) * (sigma_n_L + 1e-8)
+        K_LH = rho * self.kernel(XL, XH, theta_L)
+        K_HH = rho ** 2 * self.kernel(XH, XH, theta_L) + \
+                        self.kernel(XH, XH, theta_H) + np.eye(NH) * (sigma_n_H + 1e-8)
         K = np.vstack((np.hstack((K_LL,K_LH)),
                        np.hstack((K_LH.T,K_HH))))
         L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch, rng_key, num_restarts = 10):
+    def train(self, batch, rng_key, num_restarts=10):
         # Define objective that returns NumPy arrays
         def objective(params):
             value, grads = self.likelihood_value_and_grad(params, batch)
@@ -1870,8 +2064,10 @@ class HeterogeneousMultifidelityGP(GPmodel):
 
         #### modify it according to the jupyter notebook
         #### Maybe jax will not stop when it see NaNs or Infs
-        #print('Likelihoods for current iteration: {}'.format(likelihood.flatten()))
-        #print('Best likelihood for current iteration: {}'.format(likelihood[idx_best]))
+        #print('Likelihoods for current iteration:
+        #{}'.format(likelihood.flatten()))
+        #print('Best likelihood for current iteration:
+        #{}'.format(likelihood[idx_best]))
         return best_params
 
     @partial(jit, static_argnums=(0,))
@@ -1881,7 +2077,7 @@ class HeterogeneousMultifidelityGP(GPmodel):
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         XL, XH = batch['XL'], batch['XH']
         D = batch['XH'].shape[1]
@@ -1894,19 +2090,19 @@ class HeterogeneousMultifidelityGP(GPmodel):
         rho = gp_params[-3]
         sigma_n_L = np.exp(gp_params[-2])
         sigma_n_H = np.exp(gp_params[-1])
-        theta_L = gp_params[:D+1]
-        theta_H = gp_params[D+1:-3]
+        theta_L = gp_params[:D + 1]
+        theta_H = gp_params[D + 1:-3]
         # Compute kernels
-        k_pp = rho**2 * self.kernel(X_star, X_star, theta_L) + \
+        k_pp = rho ** 2 * self.kernel(X_star, X_star, theta_L) + \
                         self.kernel(X_star, X_star, theta_H) + \
-                        np.eye(X_star.shape[0])*(sigma_n_H + 1e-8)
-        psi1 = rho*self.kernel(X_star, XL, theta_L)
-        psi2 = rho**2 * self.kernel(X_star, XH, theta_L) + \
+                        np.eye(X_star.shape[0]) * (sigma_n_H + 1e-8)
+        psi1 = rho * self.kernel(X_star, XL, theta_L)
+        psi2 = rho ** 2 * self.kernel(X_star, XH, theta_L) + \
                         self.kernel(X_star, XH, theta_H)
         k_pX = np.hstack((psi1,psi2))
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -1945,19 +2141,19 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
         rho = gp_params[-3]
         sigma_n_L = np.exp(gp_params[-2])
         sigma_n_H = np.exp(gp_params[-1])
-        theta_L = gp_params[:D+1]
-        theta_H = gp_params[D+1:-3]
+        theta_L = gp_params[:D + 1]
+        theta_H = gp_params[D + 1:-3]
         # Compute kernels
-        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL)*(sigma_n_L + 1e-8)
-        K_LH = rho*self.kernel(XL, XH, theta_L)
-        K_HH = rho**2 * self.kernel(XH, XH, theta_L) + \
-                        self.kernel(XH, XH, theta_H) + np.eye(NH)*(sigma_n_H + 1e-8)
+        K_LL = self.kernel(XL, XL, theta_L) + np.eye(NL) * (sigma_n_L + 1e-8)
+        K_LH = rho * self.kernel(XL, XH, theta_L)
+        K_HH = rho ** 2 * self.kernel(XH, XH, theta_L) + \
+                        self.kernel(XH, XH, theta_H) + np.eye(NH) * (sigma_n_H + 1e-8)
         K = np.vstack((np.hstack((K_LL,K_LH)),
                        np.hstack((K_LH.T,K_HH))))
         L = cholesky(K, lower=True)
         return L
 
-    def train(self, batch_list, rng_key, num_restarts = 10):
+    def train(self, batch_list, rng_key, num_restarts=10):
         best_params = []
         for _, batch in enumerate(batch_list):
             # Define objective that returns NumPy arrays
@@ -1994,13 +2190,14 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
     def predict_all(self, X_star, **kwargs):
         mu_list = []
         std_list = []
-        params_list =  kwargs['params']
+        params_list = kwargs['params']
         batch_list = kwargs['batch']
         bounds = kwargs['bounds']
         norm_const_list = kwargs['norm_const']
         zipped_args = zip(params_list, batch_list, norm_const_list)
-        # Normalize to [0,1] (We should do this for once instead of iteratively doing so in the for loop)
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        # Normalize to [0,1] (We should do this for once instead of iteratively
+        # doing so in the for loop)
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
 
         for k, (params, batch, norm_const) in enumerate(zipped_args):
             # Fetch normalized training data
@@ -2015,26 +2212,26 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
             rho = gp_params[-3]
             sigma_n_L = np.exp(gp_params[-2])
             sigma_n_H = np.exp(gp_params[-1])
-            theta_L = gp_params[:D+1]
-            theta_H = gp_params[D+1:-3]
+            theta_L = gp_params[:D + 1]
+            theta_H = gp_params[D + 1:-3]
             # Compute kernels
-            k_pp = rho**2 * self.kernel(X_star, X_star, theta_L) + \
+            k_pp = rho ** 2 * self.kernel(X_star, X_star, theta_L) + \
                             self.kernel(X_star, X_star, theta_H) + \
-                            np.eye(X_star.shape[0])*(sigma_n_H + 1e-8)
-            psi1 = rho*self.kernel(X_star, XL, theta_L)
-            psi2 = rho**2 * self.kernel(X_star, XH, theta_L) + \
+                            np.eye(X_star.shape[0]) * (sigma_n_H + 1e-8)
+            psi1 = rho * self.kernel(X_star, XL, theta_L)
+            psi2 = rho ** 2 * self.kernel(X_star, XH, theta_L) + \
                             self.kernel(X_star, XH, theta_H)
             k_pX = np.hstack((psi1,psi2))
             L = self.compute_cholesky(params, batch)
             alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-            beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+            beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
             # Compute predictive mean, std
             mu = np.matmul(k_pX, alpha)
             cov = k_pp - np.matmul(k_pX, beta)
             std = np.sqrt(np.clip(np.diag(cov), a_min=0.))
             if k > 0:
-                mu = mu*norm_const['sigma_y'] + norm_const['mu_y']
-                std = std*norm_const['sigma_y']
+                mu = mu * norm_const['sigma_y'] + norm_const['mu_y']
+                std = std * norm_const['sigma_y']
             mu_list.append(mu)
             std_list.append(std)
         return np.array(mu_list), np.array(std_list)
@@ -2046,7 +2243,7 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
         bounds = kwargs['bounds']
         norm_const = kwargs['norm_const']
         # Normalize to [0,1]
-        X_star = (X_star - bounds['lb'])/(bounds['ub'] - bounds['lb'])
+        X_star = (X_star - bounds['lb']) / (bounds['ub'] - bounds['lb'])
         # Fetch normalized training data
         XL, XH = batch['XL'], batch['XH']
         D = batch['XH'].shape[1]
@@ -2059,19 +2256,19 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
         rho = gp_params[-3]
         sigma_n_L = np.exp(gp_params[-2])
         sigma_n_H = np.exp(gp_params[-1])
-        theta_L = gp_params[:D+1]
-        theta_H = gp_params[D+1:-3]
+        theta_L = gp_params[:D + 1]
+        theta_H = gp_params[D + 1:-3]
         # Compute kernels
-        k_pp = rho**2 * self.kernel(X_star, X_star, theta_L) + \
+        k_pp = rho ** 2 * self.kernel(X_star, X_star, theta_L) + \
                         self.kernel(X_star, X_star, theta_H) + \
-                        np.eye(X_star.shape[0])*(sigma_n_H + 1e-8)
-        psi1 = rho*self.kernel(X_star, XL, theta_L)
-        psi2 = rho**2 * self.kernel(X_star, XH, theta_L) + \
+                        np.eye(X_star.shape[0]) * (sigma_n_H + 1e-8)
+        psi1 = rho * self.kernel(X_star, XL, theta_L)
+        psi2 = rho ** 2 * self.kernel(X_star, XH, theta_L) + \
                         self.kernel(X_star, XH, theta_H)
         k_pX = np.hstack((psi1,psi2))
         L = self.compute_cholesky(params, batch)
         alpha = solve_triangular(L.T,solve_triangular(L, y, lower=True))
-        beta  = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
+        beta = solve_triangular(L.T,solve_triangular(L, k_pX.T, lower=True))
         # Compute predictive mean, std
         mu = np.matmul(k_pX, alpha)
         cov = k_pp - np.matmul(k_pX, beta)
@@ -2093,7 +2290,8 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
             return acquisitions.LCBC(mean, std, kappa)
         elif self.options['constrained_criterion'] == 'LW_LCBC':
             kappa = kwargs['kappa']
-            ##### normalize the mean and std again and subtract the mean by 3*sigma
+            ##### normalize the mean and std again and subtract the mean by
+            ##### 3*sigma
             weights = utils.compute_w_gmm(x, **kwargs)
             return acquisitions.LW_LCBC(mean, std, weights, kappa)
         else:
@@ -2106,7 +2304,7 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
         grads = f_vjp(np.ones_like(primals))[0]
         return primals, grads
 
-    def constrained_compute_next_point_lbfgs(self, num_restarts = 10, **kwargs):
+    def constrained_compute_next_point_lbfgs(self, num_restarts=10, **kwargs):
         # Define objective that returns NumPy arrays
         def objective(x):
             value, grads = self.constrained_acq_value_and_grad(x, **kwargs)
@@ -2122,7 +2320,7 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
         dim = lb.shape[0]
 
         onp.random.seed(rng_key[0])
-        x0 = lb + (ub-lb)*lhs(dim, num_restarts)
+        x0 = lb + (ub - lb) * lhs(dim, num_restarts)
         #print("x0 for bfgs", x0)
         dom_bounds = tuple(map(tuple, np.vstack((lb, ub)).T))
         for i in range(num_restarts):
@@ -2132,11 +2330,11 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
         loc = np.vstack(loc)
         acq = np.vstack(acq)
         idx_best = np.argmin(acq)
-        x_new = loc[idx_best:idx_best+1,:]
+        x_new = loc[idx_best:idx_best + 1,:]
         return x_new, acq, loc
 
 
-    def fit_gmm(self, num_comp = 2, N_samples = 10000, **kwargs):
+    def fit_gmm(self, num_comp=2, N_samples=10000, **kwargs):
         bounds = kwargs['bounds']
         lb = bounds['lb']
         ub = bounds['ub']
@@ -2145,13 +2343,14 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
         rng_key = kwargs['rng_key']
         dim = lb.shape[0]
         # Sample data across the entire domain
-        X = lb + (ub-lb)*lhs(dim, N_samples)
+        X = lb + (ub - lb) * lhs(dim, N_samples)
 
         # set the seed for sampling X
         onp.random.seed(rng_key[0])
-        X = lb + (ub-lb)*lhs(dim, N_samples)
+        X = lb + (ub - lb) * lhs(dim, N_samples)
 
-        # We only keep the first row that correspond to the objective prediction and same for y_samples
+        # We only keep the first row that correspond to the objective
+        # prediction and same for y_samples
         y = self.predict_all(X, **kwargs)[0][0,:]
 
         # Prediction of the constraints
@@ -2161,7 +2360,7 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
         #print('mu_c', 'std_c', mu_c.shape, std_c.shape)
         constraint_w = np.ones((std_c.shape[1],1)).flatten()
         for k in range(std_c.shape[0]):
-            constraint_w_temp = norm.cdf(mu_c[k,:]/std_c[k,:])
+            constraint_w_temp = norm.cdf(mu_c[k,:] / std_c[k,:])
             if np.sum(constraint_w_temp) > 1e-8:
                 constraint_w = constraint_w * constraint_w_temp
         #print("constraint_w", constraint_w.shape)
@@ -2170,7 +2369,7 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
         rng_key = random.split(rng_key)[0]
         onp.random.seed(rng_key[0])
 
-        X_samples = lb + (ub-lb)*lhs(dim, N_samples)
+        X_samples = lb + (ub - lb) * lhs(dim, N_samples)
         y_samples = self.predict_all(X_samples, **kwargs)[0][0,:]
 
 
@@ -2181,7 +2380,7 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
         p_y = utils.fit_kernel_density(y_samples, y, weights = p_x_samples)
 
         #print("constraint_w", constraint_w.shape, "p_x", p_x.shape)
-        weights = p_x/p_y*constraint_w
+        weights = p_x / p_y * constraint_w
         # Label each input data
         indices = np.arange(N_samples)
         # Scale inputs to [0, 1]^D
@@ -2198,7 +2397,6 @@ class MultipleIndependentHeterogeneousMFGP(GPmodel):
                                       covariance_type='full')
         clf.fit(X_train)
         return clf.weights_, clf.means_, clf.covariances_
-
 
 
 
